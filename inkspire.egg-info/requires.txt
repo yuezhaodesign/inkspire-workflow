@@ -1,0 +1,7 @@
+typer[all]
+httpx
+python-dotenv
+pydantic
+tenacity
+rich
+tqdm

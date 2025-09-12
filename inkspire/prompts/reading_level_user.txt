@@ -1,0 +1,108 @@
+# Reading Scaffold Analysis: [Chapter Title]
+
+## Workflow Instructions
+
+### Phase 1: Material Characterization
+
+Analyze and document the following for the provided content:
+
+**A. Content Type Distribution**
+- Conceptual explanations (theory, principles, patterns)
+- Code examples (syntax demonstrations, complete programs)
+- Hybrid sections (code with embedded explanations)
+- Visual elements (diagrams, flowcharts, memory models)
+- Interactive elements (exercises, practice problems)
+
+**B. Cognitive Load Assessment**
+- Vocabulary density (new terms per section)
+- Abstraction level (concrete examples vs. abstract concepts)
+- Prerequisite knowledge requirements
+- Working memory demands (variable tracking, nested structures)
+
+**C. Reading Patterns Required**
+- Linear (sequential progression)
+- Non-linear (following control flow)
+- Reference-oriented (looking up syntax/methods)
+- Comparative (multiple examples of same concept)
+
+**D. Disciplinary Features**
+- How knowledge is validated (testing, debugging, peer review)
+- Problem-solving approaches demonstrated
+- Technical discourse markers and conventions
+- Representation transitions (prose→code, diagram→implementation)
+
+### Phase 2: Scaffold-Worthy Area Identification
+
+Identify 5-8 key areas per reading that would benefit most from scaffolding, prioritizing:
+
+**High-Priority Targets:**
+
+1. **Conceptual Bridges** - Where abstract concepts connect to concrete implementations
+2. **First Encounters** - Introduction of new programming constructs or patterns
+3. **Cognitive Bottlenecks** - Complex code requiring multiple variable tracking
+4. **Multimodal Integration Points** - Where students must synthesize across representations
+5. **Pattern Recognition Opportunities** - Similar structures across different contexts
+6. **Debugging/Testing Scenarios** - Error identification and correction examples
+7. **Reflective AI Sections** - Discussions of effective and responsible AI usage in programming
+
+**Selection Criteria:**
+
+- Concepts that build on each other (scaffolding sequences)
+- Areas with high transfer potential to future topics
+- Common misconception points from CS education research
+- Opportunities for both individual and collaborative work
+
+### Phase 3: Annotation-Based Scaffold Generation
+
+For each identified area, create instructor annotations using these strategies:
+
+**A. For Conceptual Reading Sections:**
+
+- **Activation Prompts** (connecting to prior knowledge)
+- **Analogy Construction** (relating to familiar concepts)
+- **Visualization Requests** (drawing mental models)
+- **Explanation Generation** (teach-back scenarios)
+
+**B. For Code Reading Sections:**
+
+- **PRIMM-Based Scaffolds:**
+  - Predict: "Before running, what will line 7 output if x=5?"
+  - Investigate: "Trace through lines 3-8 using a memory table"
+  - Modify: "How would behavior change if we switched lines 4 and 5?"
+- **Memory Table Construction** (systematic variable tracking)
+- **Control Flow Mapping** (execution path visualization)
+- **Purpose Articulation** (explain in plain English without restating code)
+
+**C. For Hybrid Sections:**
+
+- **Code-Concept Mapping** (link implementation to theory)
+- **Pattern Extraction** (identify reusable structures)
+- **Comparison Tasks** (contrast approaches)
+- **Translation Exercises** (pseudocode ↔ Python)
+
+**D. For Problem-Solving Sections:**
+
+- **TIPP&SEE Applications** (systematic analysis protocol)
+- **Metacognitive Prompts** (strategy awareness)
+- **Error Prediction** (anticipate common mistakes)
+- **Test Case Generation** (boundary condition thinking)
+
+## Example Analysis Output Structure
+
+```markdown
+# Reading Scaffold Analysis: [Chapter Title]
+
+## Material Characteristics
+- **Content Distribution:** 40% conceptual, 35% code examples, 25% exercises
+- **Key Modalities:** Text, code blocks, execution traces, flowcharts
+- **Cognitive Demands:** High working memory load in recursion section
+- **Reading Pattern:** Primarily non-linear, following function calls
+
+## Identified Focus Areas
+1. List comprehension introduction (p. 45-47) - First encounter with Pythonic syntax
+2. Recursion visualization (p. 52-54) - High cognitive load, needs memory modeling
+3. Exception handling patterns (p. 58-60) - Conceptual to practical bridge
+[continue...]
+
+## Generated Scaffolds
+[Individual scaffolds following the format above]

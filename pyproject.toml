@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkspire"
+version = "0.1.0"
+description = "Integrated Perusall annotation pipeline"
+requires-python = ">=3.10"
+dependencies = ["typer[all]", "httpx", "python-dotenv", "pydantic", "tenacity", "rich", "tqdm"]
+
+[project.scripts]
+inkspire = "inkspire.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["inkspire*"]
+exclude = ["content*", "tests*", "examples*", "docs*"]
