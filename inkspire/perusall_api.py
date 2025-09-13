@@ -242,14 +242,6 @@ class PerusallClient:
     # ----------- DEBUG/EXPORT ARTIFACTS ----------- #
 
     def export_debug_artifacts(self, course_id: str, document_id: str, out_dir: str) -> Dict[str, str]:
-        """
-        Writes three files to `out_dir` that mirror the GET examples:
-          1) perusall_data.json                     -> raw library JSON from /library/<documentId>
-          2) perusall_data_extracted.txt            -> concatenated raw payloads from textContentUrl (JSON/plain text)
-          3) perusall_data_extracted_cleaned.txt    -> cleaned pure text (ready for generation)
-
-        Returns dict of written file paths.
-        """
         os.makedirs(out_dir, exist_ok=True)
 
         # (1) Library JSON
