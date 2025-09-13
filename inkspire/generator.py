@@ -1,15 +1,6 @@
-# inkspire/generator.py
-# Multi-agent flow (A/B/C) with LangChain + Gemini 2.5 Flash
-# Public API: generate_annotations(material_text, kb_texts, provider="gemini")
-# Guarantees:
-# - Returns list of dicts with at least {"target_span", "text"}
-# - Robust fallback when LLM/deps are unavailable
-# - Attempts to map LLM spans back to exact substrings in source text
-# - Avoids acknowledgments/author lists as scaffold targets
-
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import os
 import json
 import re
@@ -30,6 +21,8 @@ try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except Exception:
     _LC_AVAILABLE = False
+
+
 
 
 # ---------------------------- Utilities ----------------------------
@@ -115,6 +108,15 @@ def _trim_span_to_reasonable_window(src: str, exact: str,
         slice_ = src[lb2:rb2].strip()
     return slice_
 
+_BODY_CUES = re.compile(r"\b(abstract|introduction)\b", flags=re.I)
+
+def _extract_body(text: str) -> str:
+    """Return the substring starting from 'Abstract' or 'Introduction' if present."""
+    if not text:
+        return ""
+    m = _BODY_CUES.search(text)
+    return text[m.start():] if m else text
+
 
 # ---------------------------- State ----------------------------
 
@@ -124,216 +126,335 @@ class PipelineState:
     kb_texts: List[str] = field(default_factory=list)
     provider: str = "gemini"
     # Outputs
-    material_summary: str = ""                          # Agent A
-    candidate_spans: List[str] = field(default_factory=list)  # Agent B
-    scaffolds: List[Dict[str, Any]] = field(default_factory=list)  # Agent C
+    material_summary: str = ""
+    candidate_spans: List[str] = field(default_factory=list)
+    scaffolds: List[Dict[str, Any]] = field(default_factory=list)
+    agent_a: Dict[str, Any] = field(default_factory=dict)
+    agent_a_path: Optional[str] = None
+    # User-supplied human prompt
+    user_human_prompt: str = ""
 
 
-# --------------------- Heuristic fallback agents ---------------------
 
-def _heuristic_agent_a(state: PipelineState) -> None:
-    text = (state.material_text or "").strip()
-    sentences = _split_sentences(text)
-    state.material_summary = (
-        f"Material length: {len(text)} chars; ~{len(sentences)} sentences. "
-        "No LLM: heuristic summary only."
-    )
+# ---------------------------- File I/O helpers ----------------------------
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = f.read()
+        _dbg(f"[FileIO] Read {len(data)} chars from {path}")
+        return data
+    except Exception as e:
+        _dbg(f"[FileIO] Failed to read {path}: {e}")
+        return ""
 
-def _score_sentence(s: str) -> float:
-    # Favor 80–300 chars and some punctuation density
-    L = len(s)
-    width = 1.0 - abs((L - 190) / 160)   # peak near 190
-    punct = s.count(",") + s.count(";")
-    return width + 0.2 * punct
+def _write_text_file(path: str, content: str) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        _dbg(f"[FileIO] Wrote {len(content)} chars to {path}")
+    except Exception as e:
+        _dbg(f"[FileIO] Failed to write {path}: {e}")
 
-def _heuristic_agent_b(state: PipelineState) -> None:
-    src = state.material_text or ""
-    sentences = _split_sentences(src)
-    ranked = sorted((s for s in sentences if not _looks_like_ack(s)),
-                    key=_score_sentence, reverse=True)
-    picks = [s for s in ranked if len(s) >= 70][:3]
-    if not picks and ranked:
-        picks = [ranked[0]]
 
-    mapped: List[str] = []
-    for s in picks:
-        rs, end_idx = find_first_occurrence(src, s)
-        if rs != -1:
-            exact = src[rs:end_idx]
-            mapped.append(_trim_span_to_reasonable_window(src, exact))
+
+# ---------------------------- Prompt loader ----------------------------
+
+def _load_user_prompts() -> str:
+    """Load and join all .txt prompts from inkspire/prompts/."""
+    # Resolve .../inkspire/prompts relative to this file
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    prompt_dir = os.path.join(base_dir, "prompts")
+
+    # Fallback: try CWD/inkspire/prompts if not found (e.g., editable runs)
+    if not os.path.isdir(prompt_dir):
+        alt = os.path.join(os.getcwd(), "inkspire", "prompts")
+        if os.path.isdir(alt):
+            prompt_dir = alt
         else:
-            mapped.append(s)
-    state.candidate_spans = mapped[:3]
+            _dbg(f"[Prompts] Prompt dir not found: {prompt_dir} and {alt}")
+            return ""
 
-def _heuristic_agent_c(state: PipelineState) -> None:
-    out: List[Dict[str, Any]] = []
-    src = state.material_text or ""
-    for i, span in enumerate(state.candidate_spans, start=1):
-        rs, end_idx = find_first_occurrence(src, span)
-        if rs != -1:
-            exact = src[rs:end_idx]
-            windowed = _trim_span_to_reasonable_window(src, exact)
-            anchor = {"start": rs, "end": end_idx, "fragment": exact}
-        else:
-            windowed = span
-            anchor = {"start": -1, "end": -1, "fragment": ""}
+    chunks: List[str] = []
+    for fname in sorted(os.listdir(prompt_dir)):
+        path = os.path.join(prompt_dir, fname)
+        if os.path.isfile(path) and fname.lower().endswith(".txt"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    txt = f.read().strip()
+                if txt:
+                    chunks.append(txt)
+            except Exception as e:
+                _dbg(f"[Prompts] Failed to read {path}: {e}")
 
-        body = (
-            f"### Scaffold #{i}\n"
-            f"**Target Passage:** {windowed}\n\n"
-            f"**Prompts:**\n"
-            f"1) Paraphrase the passage in your own words (2–3 sentences).\n"
-            f"2) Provide a micro-example (3–5 lines) illustrating the idea.\n"
-            f"3) Identify one limitation, assumption, or failure case.\n"
-        )
-        out.append({
-            "title": f"Scaffold #{i}",
-            "target_span": windowed,
-            "text": body,
-            "anchor": anchor
-        })
-    state.scaffolds = out
+    joined = "\n\n---\n\n".join(chunks)
+    # Cap to avoid blowing context; adjust if you have larger budgets.
+    capped = joined[:4000]
+    _dbg(f"[Prompts] Loaded {len(chunks)} files; total chars={len(capped)}")
+    return capped
+
 
 
 # --------------------- Gemini-backed agents (LangChain) ---------------------
 
-def _build_gemini(model_name: str = "gemini-2.5-flash", temperature: float = 0.2):
-    if not _LC_AVAILABLE:
-        raise RuntimeError("LangChain or langchain-google-genai not available.")
-    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set for Gemini.")
-    return ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
-
 def _agent_a_llm(llm: "ChatGoogleGenerativeAI"):
     prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are Agent A (Material Characterization). Read the provided text and produce:\n"
-         "1) A 1-2 sentence high-level summary.\n"
-         "2) 3-6 salient key terms (lowercase, comma separated).\n"
-         "Return JSON with fields: summary: str, keywords: list[str]."),
-        ("human", "{material_text}")
+        ("system", "You are Agent A."),
+        ("human",
+         # User-supplied instructions first (if any), then your fixed spec, then data.
+         "USER INSTRUCTIONS (verbatim):\n{user_human_prompt}\n\n"
+         "ROLE: Agent A (Material Characterization).\n\n"
+         "When given textbook content (MATERIAL), analyze and document:\n"
+         "A. Content Type Distribution\n"
+         "- Conceptual explanations (theory, principles, patterns)\n"
+         "- Code examples (syntax demonstrations, complete programs)\n"
+         "- Hybrid sections (code with embedded explanations)\n"
+         "- Visual elements (diagrams, flowcharts, memory models)\n"
+         "- Interactive elements (exercises, practice problems)\n\n"
+         "B. Cognitive Load Assessment\n"
+         "- Vocabulary density (new terms per section)\n"
+         "- Abstraction level (concrete examples vs. abstract concepts)\n"
+         "- Prerequisite knowledge requirements\n"
+         "- Working memory demands (variable tracking, nested structures)\n\n"
+         "C. Reading Patterns Required\n"
+         "- Linear, Non-linear, Reference-oriented, Comparative\n\n"
+         "D. Disciplinary Features\n"
+         "- Validation (testing/debugging/peer review), problem-solving approaches,\n"
+         "  discourse markers, representation transitions (prose→code, diagram→impl)\n\n"
+         "OUTPUT (Markdown only; no code fences, no JSON):\n"
+         "# Reading Scaffold Analysis: [Chapter Title]\n\n"
+         "## Material Characteristics\n"
+         "- **Content Distribution:** <e.g., 40% conceptual, 35% code examples, 25% exercises>\n"
+         "- **Key Modalities:** <e.g., Text, code blocks, execution traces, flowcharts>\n"
+         "- **Cognitive Demands:** <e.g., High working memory load in recursion section>\n"
+         "- **Reading Pattern:** <e.g., Primarily non-linear, following function calls>\n\n"
+         "RULES: Output valid Markdown only (no code fences), ≤300 words, infer chapter title if absent.\n\n"
+         "MATERIAL:\n{material_text}")
     ])
     chain = prompt | llm | StrOutputParser()
 
     def _run(state: PipelineState) -> PipelineState:
-        raw = chain.invoke({"material_text": state.material_text[:12000]})
+        raw_md = chain.invoke({
+            "material_text": state.material_text[:12000],
+            "user_human_prompt": state.user_human_prompt
+        })
+        md_output = raw_md.strip()
+        payload = {"markdown": md_output}
+        state.material_summary = md_output
+
+        path = os.getenv("INKSPIRE_AGENT_A_PATH", "agent_a.json")
         try:
-            data = json.loads(raw)
-            summary = str(data.get("summary", "")).strip()
-        except Exception:
-            summary = raw.strip().strip("`")
-        state.material_summary = summary[:2000]
+            _write_text_file(path, json.dumps(payload, ensure_ascii=False, indent=2))
+            state.agent_a_path = path
+            state.agent_a = payload
+        except Exception as e:
+            _dbg(f"[AgentA] write failed: {e}")
+            state.agent_a_path = None
+            state.agent_a = payload
+
         return state
 
     return RunnableLambda(_run)
 
+
+
+
 def _agent_b_llm(llm: "ChatGoogleGenerativeAI"):
     prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are Agent B (Scaffold-Worthy Area Identification). From the input text, pick 1-3 passages that are challenging or central.\n"
-         "CRITICAL:\n"
-         "- Return exact substrings copied verbatim from the input (no rewriting).\n"
-         "- Prefer longer, information-dense spans (80-300 chars).\n"
-         "- Avoid acknowledgments, author lists, affiliations, emails, and references sections.\n"
-         "Return a JSON array of strings, e.g. [\"span1\", \"span2\"]."),
-        ("human", "{material_text}")
+        ("system", "You are Agent B."),
+        ("human",
+         "USER INSTRUCTIONS (verbatim):\n{user_human_prompt}\n\n"
+         "ROLE: Agent B (Scaffold-Worthy Passage Identification).\n\n"
+         "Identify 5–8 key areas per reading that would benefit most from scaffolding, prioritizing:\n\n"
+         "**High-Priority Targets:**\n"
+         "1. Conceptual Bridges – Where abstract concepts connect to concrete implementations\n"
+         "2. First Encounters – Introduction of new programming constructs or patterns\n"
+         "3. Cognitive Bottlenecks – Complex code requiring multiple variable tracking\n"
+         "4. Multimodal Integration Points – Where students must synthesize across representations\n"
+         "5. Pattern Recognition Opportunities – Similar structures across different contexts\n"
+         "6. Debugging/Testing Scenarios – Error identification and correction examples\n"
+         "7. Reflective AI Sections – Discussions of effective and responsible AI usage in programming\n\n"
+         "**Selection Criteria:**\n"
+         "- Concepts that build on each other (scaffolding sequences)\n"
+         "- Areas with high transfer potential to future topics\n"
+         "- Common misconception points from CS education research\n"
+         "- Opportunities for both individual and collaborative work\n\n"
+         "CONSTRAINTS:\n"
+         "- Passages MUST be exact substrings copied verbatim from MATERIAL.\n"
+         "- Each passage length: 70–350 chars.\n"
+         "- Exclude acknowledgments, author lists, affiliations, emails, references.\n\n"
+         "ADDITIONAL CONTEXT (Agent A Markdown):\n{agent_a_md}\n\n"
+         "MATERIAL:\n{material_text}\n\n"
+         "OUTPUT: JSON array of strings, each an exact substring.")
     ])
     chain = prompt | llm | StrOutputParser()
 
     def _run(state: PipelineState) -> PipelineState:
-        src = state.material_text
-        raw = chain.invoke({"material_text": src[:40000]})
+        src = state.material_text or ""
+        a_md = state.agent_a.get("markdown", "")
+
+        raw_output = chain.invoke({
+            "material_text": src[:40000],
+            "agent_a_md": a_md[:4000],
+            "user_human_prompt": state.user_human_prompt
+        })
+        # ... (rest of your parsing/mapping/dedup logic unchanged)
         spans: List[str] = []
         try:
-            data = json.loads(raw)
+            data = json.loads(raw_output)
             if isinstance(data, list):
                 spans = [s for s in data if isinstance(s, str)]
         except Exception:
-            # salvage quoted lines if any
-            spans = re.findall(r'"([^"]{40,500})"', raw)[:3]
+            spans = re.findall(r'"([^"]{40,800})"', raw_output)[:8]
 
-        # post-filter: drop ack-looking spans
-        spans = [s for s in spans if not _looks_like_ack(s)]
+        spans = [s.strip() for s in spans if s and not _looks_like_ack(s)]
 
-        # map to exact substrings in src (using robust locator)
         mapped: List[str] = []
         for s in spans:
             rs, end_idx = find_first_occurrence(src, s)
             if rs != -1:
                 exact = src[rs:end_idx]
                 mapped.append(_trim_span_to_reasonable_window(src, exact))
-        if not mapped:
-            _heuristic_agent_b(state)
-        else:
-            state.candidate_spans = mapped[:3]
+            else:
+                mapped.append(s)
+
+        seen, out = set(), []
+        for m in mapped:
+            key = re.sub(r"\s+", " ", m.lower())[:200]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+
+        state.candidate_spans = out[:8]
+        _dbg(f"[AgentB] candidates={len(state.candidate_spans)}")
         return state
 
     return RunnableLambda(_run)
+
+
 
 def _agent_c_llm(llm: "ChatGoogleGenerativeAI"):
     prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are Agent C (Annotation-Based Scaffold Generation).\n"
-         "For each TARGET SPAN, create a short scaffold (markdown) with exactly these prompts:\n"
-         "1) Paraphrase the passage in your own words (2–3 sentences).\n"
-         "2) Provide a micro-example (3–5 lines) illustrating the idea.\n"
-         "3) Identify one limitation, assumption, or failure case.\n"
-         # Escape braces so LangChain doesn't treat them as variables:
-         "Return JSON array of objects: [{{\"target_span\": string, \"markdown\": string}}].\n"
-         "IMPORTANT: The braces above are a literal JSON example; do not treat them as variables."
-        ),
+        ("system", "You are Agent C."),
         ("human",
+         "USER INSTRUCTIONS (verbatim):\n{user_human_prompt}\n\n"
+         "For each identified area, create instructor annotations using these strategies:\n\n"
+         "**A. For Conceptual Reading Sections:**\n"
+         "- Activation Prompts (connecting to prior knowledge)\n"
+         "- Analogy Construction (relating to familiar concepts)\n"
+         "- Visualization Requests (drawing mental models)\n"
+         "- Explanation Generation (teach-back scenarios)\n\n"
+         "**B. For Code Reading Sections:**\n"
+         "- PRIMM-Based Scaffolds:\n"
+         "  - Predict: \"Before running, what will line 7 output if x=5?\"\n"
+         "  - Investigate: \"Trace through lines 3–8 using a memory table\"\n"
+         "  - Modify: \"How would behavior change if we switched lines 4 and 5?\"\n"
+         "- Memory Table Construction (systematic variable tracking)\n"
+         "- Control Flow Mapping (execution path visualization)\n"
+         "- Purpose Articulation (explain in plain English without restating code)\n\n"
+         "**C. For Hybrid Sections:**\n"
+         "- Code-Concept Mapping (link implementation to theory)\n"
+         "- Pattern Extraction (identify reusable structures)\n"
+         "- Comparison Tasks (contrast approaches)\n"
+         "- Translation Exercises (pseudocode ↔ Python)\n\n"
+         "**D. For Problem-Solving Sections:**\n"
+         "- TIPP&SEE Applications (systematic analysis protocol)\n"
+         "- Metacognitive Prompts (strategy awareness)\n"
+         "- Error Prediction (anticipate common mistakes)\n"
+         "- Test Case Generation (boundary condition thinking)\n\n"
+         "## Output Format\n\n"
+         "For each scaffold, provide:\n\n"
+         "### Scaffold #N: [Descriptive Title]\n"
+         "**Content Type:** [Conceptual | Code | Hybrid | Problem-Solving]\n"
+         "**Cognitive Focus:** [e.g., variable tracking, pattern recognition, conceptual understanding]\n\n"
+         "**Scaffold Prompt:**\n"
+         "[The actual question/task/suggestion for students - written in clear, engaging language]\n\n"
+         "**Strategy Foundation:** [e.g., PRIMM-Investigate, Metacognitive Reflection, Memory Table]\n"
+         "**Expected Engagement Time:** [2-5 minutes | 5-10 minutes | 10-15 minutes]\n"
+         "**Collaboration Mode:** [Individual | Pair | Small Group]\n\n"
+         "**Learning Objective:** [What students should gain from this scaffold]\n\n"
+         "**Instructor Note:** [Brief guidance on implementation or common student responses]\n"
+         "---\n\n"
          "TARGET SPANS (JSON):\n{spans_json}\n\n"
-         "GLOBAL CONTEXT (truncated):\n{material_head}")
+         "GLOBAL CONTEXT (truncated):\n{material_head}\n\n"
+         "OUTPUT: return ONLY a JSON array of objects with keys \"target_span\" and \"text\".\n"
+         "Max 180 words per scaffold. No code fences; no extra prose.")
     ])
     chain = prompt | llm | StrOutputParser()
 
+
     def _run(state: PipelineState) -> PipelineState:
-        spans = state.candidate_spans[:3]
-        src = state.material_text
-        raw = chain.invoke({
+        spans = state.candidate_spans[:8]
+        src = state.material_text or ""
+
+        raw_output = chain.invoke({
             "spans_json": json.dumps(spans, ensure_ascii=False),
-            "material_head": src[:1200]
+            "material_head": src[:1200],
+            "user_human_prompt": state.user_human_prompt
         })
+
         out: List[Dict[str, Any]] = []
+        parsed: List[Dict[str, Any]] = []
         try:
-            data = json.loads(raw)
+            data = json.loads(raw_output)
             if isinstance(data, list):
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    span = str(item.get("target_span", "")).strip()
-                    md = str(item.get("markdown", "")).strip()
-                    if not span or not md:
-                        continue
-
-                    rs, end_idx = find_first_occurrence(src, span)
-                    if rs == -1:
-                        continue
-                    exact = src[rs:end_idx]
-                    windowed = _trim_span_to_reasonable_window(src, exact)
-
-                    out.append({
-                        "title": "Scaffold",
-                        "target_span": windowed,
-                        "text": md,
-                        "anchor": {"start": rs, "end": end_idx, "fragment": exact},
-                    })
+                parsed = [d for d in data if isinstance(d, dict)]
         except Exception:
-            _heuristic_agent_c(state)
-            return state
+            m = re.search(r'\[[\s\S]*\]', raw_output)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                    if isinstance(data, list):
+                        parsed = [d for d in data if isinstance(d, dict)]
+                except Exception:
+                    parsed = []
 
-        if not out:
-            _heuristic_agent_c(state)
-        else:
-            state.scaffolds = out
+        for idx, item in enumerate(parsed, start=1):
+            span = str(item.get("target_span", "")).strip()
+            txt = str(item.get("text", "") or item.get("markdown", "")).strip()
+            if not span or not txt:
+                continue
+            rs, end_idx = find_first_occurrence(src, span)
+            if rs != -1:
+                exact = src[rs:end_idx]
+                windowed = _trim_span_to_reasonable_window(src, exact)
+                anchor = {"start": rs, "end": end_idx, "fragment": exact}
+            else:
+                windowed = span
+                anchor = {"start": -1, "end": -1, "fragment": ""}
+
+            if not txt.lstrip().startswith("### Scaffold #"):
+                txt = f"### Scaffold #{idx}: (Auto)\n" + txt
+
+            out.append({
+                "title": f"Scaffold #{idx}",
+                "target_span": windowed,
+                "text": txt,
+                "anchor": anchor,
+            })
+
+        state.scaffolds = out
         return state
 
     return RunnableLambda(_run)
 
 
+
 # --------------------------- Orchestration ---------------------------
+
+def _build_gemini(model_name: str = "gemini-2.5-flash", temperature: float = 0.2):
+    """
+    Construct the Gemini chat model via langchain_google_genai.
+    Raises clear errors if LangChain or GOOGLE_API_KEY are not available.
+    """
+    if not _LC_AVAILABLE:
+        raise RuntimeError("LangChain / langchain-google-genai not available (install or check imports).")
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set. Export it before running.")
+    return ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
+
+
 
 def _run_llm_pipeline(state: PipelineState, model_name: str = "gemini-2.5-flash") -> PipelineState:
     llm = _build_gemini(model_name=model_name, temperature=0.2)
@@ -345,62 +466,22 @@ def _run_llm_pipeline(state: PipelineState, model_name: str = "gemini-2.5-flash"
     s = c.invoke(s)
     return s
 
-def _run_heuristic_pipeline(state: PipelineState) -> PipelineState:
-    _heuristic_agent_a(state)
-    _heuristic_agent_b(state)
-    _heuristic_agent_c(state)
-    return state
 
 
 # ---------------------------- Public API ----------------------------
 
 def generate_annotations(material_text: str, kb_texts: List[str], provider: str = "gemini") -> List[Dict[str, Any]]:
-    """
-    Entry used by pipeline.run().
-    Returns a list of annotations, each with {"target_span", "text"}.
-    Uses Gemini 2.5 Flash via LangChain; falls back heuristically if unavailable.
-    """
     state = PipelineState(
         material_text=material_text or "",
         kb_texts=kb_texts or [],
         provider=(provider or "gemini").lower(),
     )
 
-    # Handle ultra-short inputs gracefully
+    # Always load prompts from inkspire/prompts/
+    state.user_human_prompt = _load_user_prompts()
+
     if len(state.material_text.strip()) < 40:
         return []
 
-    used_llm = True
-    try:
-        state = _run_llm_pipeline(state, model_name="gemini-2.5-flash")
-    except Exception as e:
-        used_llm = False
-        _dbg(f"Falling back to heuristic pipeline due to error: {e}")
-        state = _run_heuristic_pipeline(state)
-
-    anns = state.scaffolds[:8]
-
-    # Add provenance hint if fallback used (non-intrusive)
-    if not used_llm:
-        for a in anns:
-            a.setdefault("meta", {})["note"] = "Generated via heuristic fallback — Gemini unavailable"
-
-    return anns
-
-
-# ----------------------- Optional local demo -----------------------
-
-if __name__ == "__main__":
-    demo = (
-        "This section defines a simple algorithm for stable matching. "
-        "The algorithm proceeds by repeatedly pairing unmatched participants until a fixed point is reached. "
-        "We provide a proof sketch that the process terminates and yields a stable outcome under standard assumptions. "
-        "As an example, consider three proposers and three receivers with strict preferences; the algorithm converges in at most nine steps."
-    )
-    res = generate_annotations(demo, kb_texts=[], provider="gemini")
-    print(f"Generated {len(res)} annotations (showing target spans & first lines):")
-    for i, r in enumerate(res, 1):
-        print(f"\n[{i}] target_span: {r['target_span'][:80]}{'...' if len(r['target_span'])>80 else ''}")
-        print(r.get('text', '').splitlines()[0] if r.get('text') else "")
-        if 'anchor' in r:
-            print(f"  -> anchor: {r['anchor'].get('start')}–{r['anchor'].get('end')}")
+    state = _run_llm_pipeline(state, model_name="gemini-2.5-flash")
+    return state.scaffolds[:8]
