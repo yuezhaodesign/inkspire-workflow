@@ -132,12 +132,4 @@ rm -rf inkspire.egg-info
 4. Run without `--dry-run` to post directly to Perusall
 
 ---
-
-## 📖 API Reference
-
-- Perusall API docs: https://apidocs.perusall.com/  
-- Inkspire uses `POST /api/v1/courses/{course_id}/documents/{document_id}/comments` for scaffolds.
-
----
-
 Happy scaffolding 🎓✨
